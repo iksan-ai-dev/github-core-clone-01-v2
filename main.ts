@@ -14,6 +14,9 @@ import {
   globalId, userJson,
 } from './store.ts';
 import {
+  listDirectory, readFile, readSubdirectory, hasPath, writeFile, removeFile, commitTree,
+} from './contents.ts';
+import {
   VIEWER_LOGIN, VIEWER_ID, VIEWER_NAME, VIEWER_EMAIL,
   ZERO_OID, FIXED_TIME, COMMIT_EPOCH,
 } from './identity.ts';
@@ -302,44 +305,12 @@ function handleRest(req: IncomingMessage, res: ServerResponse, path: string, q: 
         if (!commitOid) { sendError(res, 404, 'Not Found'); return; }
         const c = parseCommit(commitOid);
         if (!c) { sendError(res, 404, 'Not Found'); return; }
-        const flat = flattenTree(c.tree);
-        if (contentPath === '') {
-          const entries = parseTree(c.tree) ?? [];
-          sendJson(res, 200, entries.map((e) => ({ type: e.mode === '40000' ? 'dir' : 'file', name: e.name, path: e.name, sha: e.oid, size: e.mode === '40000' ? 0 : (objects.get(e.oid)?.data.length ?? 0) })));
-          return;
-        }
-        const file = flat.get(contentPath);
-        if (file) {
-          const data = objects.get(file.oid)?.data ?? Buffer.alloc(0);
-          sendJson(res, 200, { type: 'file', encoding: 'base64', content: data.toString('base64'), sha: file.oid, size: data.length, name: contentPath.split('/').pop(), path: contentPath });
-          return;
-        }
-        // directory listing at a subpath
-        const prefix = `${contentPath}/`;
-        const children = new Map<string, { type: string; sha: string; size: number }>();
-        for (const [p, info] of flat) {
-          if (!p.startsWith(prefix)) continue;
-          const restPath = p.slice(prefix.length);
-          const first = restPath.split('/')[0] as string;
-          if (restPath.includes('/')) {
-            if (!children.has(first)) {
-              // tree sha for the directory
-              let dirTree = c.tree;
-              for (const seg of `${contentPath}/${first}`.split('/')) {
-                const entries = parseTree(dirTree) ?? [];
-                const found = entries.find((e) => e.name === seg);
-                dirTree = found ? found.oid : dirTree;
-              }
-              children.set(first, { type: 'dir', sha: dirTree, size: 0 });
-            }
-          } else {
-            children.set(first, { type: 'file', sha: info.oid, size: objects.get(info.oid)?.data.length ?? 0 });
-          }
-        }
-        if (children.size) {
-          sendJson(res, 200, [...children.entries()].map(([name, info]) => ({ type: info.type, name, path: `${contentPath}/${name}`, sha: info.sha, size: info.size })));
-          return;
-        }
+        const file = contentPath === '' ? null : readFile(c.tree, contentPath);
+        if (file !== null) { sendJson(res, 200, file); return; }
+        const entries = contentPath === ''
+          ? listDirectory(c.tree, '')
+          : readSubdirectory(c.tree, contentPath);
+        if (entries.length > 0) { sendJson(res, 200, entries); return; }
         sendError(res, 404, 'Not Found');
         return;
       }
@@ -350,33 +321,24 @@ function handleRest(req: IncomingMessage, res: ServerResponse, path: string, q: 
         const branch = str(b.branch, r.headRef);
         const tip = r.refs.get(branch);
         let tree = tip ? (parseCommit(tip)?.tree ?? null) : null;
-        const parents: string[] = tip ? [tip] : [];
         if (req.method === 'PUT') {
-          // A supplied sha must match the file's current blob sha, else 409.
-          if (typeof b.sha === 'string' && tree) {
-            const current = flattenTree(tree).get(contentPath);
-            if (current && b.sha !== current.oid) { sendError(res, 409, 'sha does not match the current file'); return; }
-          }
-          const content = str(b.content);
-          const decoded = b64decode(content);
-          const blobOid = storeObject('blob', decoded);
-          tree = setPathInTree(tree, contentPath.split('/'), blobOid);
-        } else {
-          if (!tree || !flattenTree(tree).has(contentPath)) { sendError(res, 404, 'Not Found'); return; }
-          tree = deletePathInTree(tree, contentPath.split('/'));
+          const wrote = writeFile(tree, contentPath, str(b.content), typeof b.sha === 'string' ? b.sha : null);
+          if ('stale' in wrote) { sendError(res, 409, 'sha does not match the current file'); return; }
+          const isCreate = !hasPath(tree, contentPath);
+          tree = wrote.tree;
+          if (tree === null) { sendError(res, 404, 'Not Found'); return; }
+          const message = str(b.message, 'update');
+          const commitOid = commitTree(r, branch, tree, message, store.commitTime());
+          const blobOid = flattenTree(tree).get(contentPath)?.oid ?? '';
+          sendJson(res, isCreate ? 201 : 200, { content: { sha: blobOid, encoding: 'base64' }, commit: { sha: commitOid } });
+          return;
         }
         if (tree === null) { sendError(res, 404, 'Not Found'); return; }
-        const message = str(b.message, req.method === 'PUT' ? 'update' : 'delete');
-        const commitOid = buildCommit(tree, parents, message, store.commitTime());
-        r.refs.set(branch, commitOid);
-        invalidateRepoCache(r);
-        if (req.method === 'PUT') {
-          const blobOid = flattenTree(tree).get(contentPath)?.oid ?? '';
-          const isCreate = !tip || !(tip && flattenTree(parseCommit(tip)?.tree ?? '').has(contentPath));
-          sendJson(res, isCreate ? 201 : 200, { content: { sha: blobOid, encoding: 'base64' }, commit: { sha: commitOid } });
-        } else {
-          sendJson(res, 200, { commit: { sha: commitOid } });
-        }
+        const next = removeFile(tree, contentPath);
+        if (next === null) { sendError(res, 404, 'Not Found'); return; }
+        const message = str(b.message, 'delete');
+        const commitOid = commitTree(r, branch, next, message, store.commitTime());
+        sendJson(res, 200, { commit: { sha: commitOid } });
         return;
       }
       sendError(res, 404, 'Not Found');
