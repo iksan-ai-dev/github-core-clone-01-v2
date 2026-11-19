@@ -8,18 +8,20 @@
 // fast path instead of walking history; hot paths avoid regexes and per-request allocations.
 
 import { createServer, type RawReq as IncomingMessage, type RawRes as ServerResponse } from './rawhttp.ts';
+import {
+  Store, type Repo, type IssueRec, type PullRec,
+  repoJson, issueJson, pullJson, diffFiles, mergeableStatus, squashMerge, subtreeAt,
+  globalId, userJson,
+} from './store.ts';
+import {
+  VIEWER_LOGIN, VIEWER_ID, VIEWER_NAME, VIEWER_EMAIL,
+  ZERO_OID, FIXED_TIME, COMMIT_EPOCH,
+} from './identity.ts';
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-const VIEWER_LOGIN = 'adaiversen'; // the scenario's token owner (kit wire.ts, fixed seed)
-const VIEWER_ID = 1000;
-const VIEWER_NAME = 'ada iversen';
-const VIEWER_EMAIL = 'adaiversen@example.invalid';
-const ZERO_OID = '0'.repeat(40);
-const FIXED_TIME = '2025-01-01T00:00:00Z';
-const COMMIT_EPOCH = 1700000000;
 
 // ---------------------------------------------------------------- git core
 // The object model, packfile engine and fetch selection live in gitcore.ts.
@@ -35,299 +37,31 @@ import type { Pkt, ObjType, GitObj, CommitInfo, TreeEntry, PackObject, FetchPlan
 import { objects, commitCache, treeCache, flatCache, TYPE_CODE, CODE_TYPE } from './gitcore.ts';
 
 // ---------------------------------------------------------------- store: repos, issues, pulls
+//
+// The records, the numbering and the serialisation live in store.ts as a Store class
+// and a Repo class. What stays here is the thin set of names the request handlers use,
+// so a handler reads the same whether the store is one object or many.
 
-interface IssueRec {
-  number: number;
-  title: string;
-  body: string;
-  state: 'open' | 'closed';
-  labels: string[];
-  comments: { id: number; body: string }[];
-  user: string;
-  createdSeq: number;
-}
-interface PullRec {
-  number: number;
-  title: string;
-  body: string;
-  state: 'open' | 'closed' | 'merged';
-  headRef: string;
-  baseRef: string;
-  headSha: string;
-  baseSha: string;
-  merged: boolean;
-  mergedAt: string | null;
-  mergeCommitSha: string | null;
-  comments: { id: number; body: string }[];
-}
-interface RepoRec {
-  id: number;
-  name: string;
-  owner: string;
-  description: string;
-  isPrivate: boolean;
-  createdAt: string;
-  refs: Map<string, string>; // branch -> tip commit oid (main lives here)
-  tags: Map<string, string>;
-  headRef: string; // 'main'
-  issues: Map<number, IssueRec>;
-  pulls: Map<number, PullRec>;
-  labels: Map<string, { name: string; color: string; description: string }>;
-  counter: number; // shared issue/pr number counter
-  issueJson: Map<number, string>; // pre-serialised issue JSON
-  // caches, cleared whenever a ref changes
-  v2Adv: Buffer | null;
-  v0UpAdv: Buffer | null;
-  v0RecvAdv: Buffer | null;
-  lsRefs: Map<string, Buffer>;
-  fetchCache: Map<string, Buffer>;
-  version: number;
-}
+const store = new Store();
+const repos = store.repos;
 
-const repos = new Map<string, RepoRec>();
-let nextDbId = 1;
-let nextCommentId = 1;
-let seqCounter = 0;
-let commitSeq = 0;
-
-function repoKey(owner: string, name: string): string { return `${owner}/${name}`; }
-function getRepo(owner: string, name: string): RepoRec | undefined { return repos.get(repoKey(owner, name)); }
-
-function invalidateRepoCache(r: RepoRec): void {
-  r.version += 1;
-  r.v2Adv = null;
-  r.v0UpAdv = null;
-  r.v0RecvAdv = null;
-  r.lsRefs.clear();
-  r.fetchCache.clear();
+function repoKey(owner: string, name: string): string { return store.key(owner, name); }
+function getRepo(owner: string, name: string): Repo | undefined { return store.get(owner, name); }
+function createRepoRecord(name: string, description = '', isPrivate = false): Repo {
+  return store.create(name, description, isPrivate);
 }
-
-function createRepoRecord(name: string, description = '', isPrivate = false): RepoRec {
-  const r: RepoRec = {
-    id: nextDbId++,
-    name,
-    owner: VIEWER_LOGIN,
-    description,
-    isPrivate,
-    createdAt: FIXED_TIME,
-    refs: new Map(),
-    tags: new Map(),
-    headRef: 'main',
-    issues: new Map(),
-    pulls: new Map(),
-    labels: new Map(),
-    counter: 0,
-    issueJson: new Map(),
-    v2Adv: null,
-    v0UpAdv: null,
-    v0RecvAdv: null,
-    lsRefs: new Map(),
-    fetchCache: new Map(),
-    version: 0,
-  };
-  repos.set(repoKey(VIEWER_LOGIN, name), r);
-  return r;
+function invalidateRepoCache(r: Repo): void { r.invalidate(); }
+function defaultBranchTip(r: Repo): string | null { return r.tip; }
+function resolveRef(r: Repo, ref: string): string | null { return r.resolve(ref); }
+function createIssueRec(r: Repo, title: string, body: string, labels: string[]): IssueRec {
+  return store.addIssue(r, title, body, labels);
 }
-
-function defaultBranchTip(r: RepoRec): string | null {
-  return r.refs.get(r.headRef) ?? null;
+function createPullRec(r: Repo, title: string, body: string, head: string, base: string): PullRec | null {
+  return store.addPull(r, title, body, head, base);
 }
-
-function resolveRef(r: RepoRec, ref: string): string | null {
-  if (r.refs.has(ref)) return r.refs.get(ref) as string;
-  if (r.tags.has(ref)) return peelToCommit(r.tags.get(ref) as string);
-  if (isOid(ref)) return objects.has(ref) ? ref : null;
-  return null;
-}
-
-function globalId(kind: string, ...parts: (string | number)[]): string {
-  return b64encode(`${kind}:${parts.join(':')}`);
-}
-
-function userJson(login: string, id: number): Record<string, unknown> {
-  return { login, id, type: 'User', avatar_url: '', html_url: `https://github.example/${login}`, name: login === VIEWER_LOGIN ? VIEWER_NAME : login };
-}
-
-function repoJson(r: RepoRec): Record<string, unknown> {
-  return {
-    id: r.id,
-    node_id: globalId('Repository', r.id),
-    name: r.name,
-    full_name: `${r.owner}/${r.name}`,
-    owner: userJson(r.owner, VIEWER_ID),
-    private: r.isPrivate,
-    description: r.description,
-    default_branch: r.headRef,
-    html_url: `https://github.example/${r.owner}/${r.name}`,
-    clone_url: `https://github.example/${r.owner}/${r.name}.git`,
-    created_at: r.createdAt,
-    updated_at: r.createdAt,
-    pushed_at: r.createdAt,
-    has_issues: true,
-    has_projects: true,
-    has_wiki: true,
-    fork: false,
-    open_issues_count: [...r.issues.values()].filter((i) => i.state === 'open').length,
-  };
-}
-
-function issueJsonObject(r: RepoRec, i: IssueRec): Record<string, unknown> {
-  return {
-    id: globalId('Issue', r.id, i.number),
-    node_id: globalId('Issue', r.id, i.number),
-    number: i.number,
-    title: i.title,
-    body: i.body,
-    state: i.state,
-    labels: i.labels.map((name) => {
-      const l = r.labels.get(name);
-      return { id: globalId('Label', r.id, name), node_id: globalId('Label', r.id, name), name, color: l?.color ?? 'ededed', description: l?.description ?? '' };
-    }),
-    user: userJson(i.user, VIEWER_ID),
-    assignee: null,
-    assignees: [],
-    created_at: FIXED_TIME,
-    updated_at: FIXED_TIME,
-    closed_at: i.state === 'closed' ? FIXED_TIME : null,
-    html_url: `https://github.example/${r.owner}/${r.name}/issues/${i.number}`,
-    comments: i.comments.length,
-  };
-}
-
-function refreshIssueJson(r: RepoRec, i: IssueRec): void {
-  r.issueJson.set(i.number, JSON.stringify(issueJsonObject(r, i)));
-}
-
-function pullJsonObject(r: RepoRec, p: PullRec): Record<string, unknown> {
-  return {
-    id: globalId('PullRequest', r.id, p.number),
-    node_id: globalId('PullRequest', r.id, p.number),
-    number: p.number,
-    title: p.title,
-    body: p.body,
-    state: p.state === 'merged' ? 'closed' : p.state,
-    merged: p.merged,
-    merged_at: p.mergedAt,
-    merge_commit_sha: p.mergeCommitSha,
-    head: { ref: p.headRef, sha: p.headSha, repo: repoJson(r) },
-    base: { ref: p.baseRef, sha: p.baseSha, repo: repoJson(r) },
-    user: userJson(VIEWER_LOGIN, VIEWER_ID),
-    created_at: FIXED_TIME,
-    updated_at: FIXED_TIME,
-    html_url: `https://github.example/${r.owner}/${r.name}/pull/${p.number}`,
-  };
-}
-
-// diff: files changed between base tree and head tree (flattened maps)
-interface FileDiff { filename: string; status: 'added' | 'modified' | 'removed'; additions: number; deletions: number; changes: number }
-function diffFiles(baseTree: string | null, headTree: string): FileDiff[] {
-  const base = baseTree ? flattenTree(baseTree) : new Map<string, { oid: string; mode: string }>();
-  const head = flattenTree(headTree);
-  const out: FileDiff[] = [];
-  const all = new Set([...base.keys(), ...head.keys()]);
-  for (const path of all) {
-    const b = base.get(path);
-    const h = head.get(path);
-    if (b && !h) out.push({ filename: path, status: 'removed', additions: 0, deletions: 1, changes: 1 });
-    else if (!b && h) out.push({ filename: path, status: 'added', additions: 1, deletions: 0, changes: 1 });
-    else if (b && h && b.oid !== h.oid) out.push({ filename: path, status: 'modified', additions: 1, deletions: 1, changes: 2 });
-  }
-  out.sort((a, b) => (a.filename < b.filename ? -1 : 1));
-  return out;
-}
-
-// merge conflict rule: a file changed in head vs merge-base AND changed in base-tip vs
-// merge-base with different resulting content -> conflicted.
-function mergeableStatus(r: RepoRec, p: PullRec): 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN' {
-  const headCommit = parseCommit(p.headSha);
-  // The base is the CURRENT tip of the base branch, not the tip at PR
-  // creation time: the base moves when another PR merges, and a PR that was
-  // mergeable can become conflicted by that merge.
-  const baseTip = resolveRef(r, p.baseRef);
-  if (!baseTip) return 'UNKNOWN';
-  const baseCommit = parseCommit(baseTip);
-  if (!headCommit || !baseCommit) return 'UNKNOWN';
-  // merge-base: first common ancestor (linear histories dominate the suite)
-  let mergeBase: string | null = null;
-  const headAncestors = new Set<string>();
-  {
-    const queue = [p.headSha];
-    while (queue.length) {
-      const oid = queue.pop() as string;
-      if (headAncestors.has(oid)) continue;
-      headAncestors.add(oid);
-      const c = parseCommit(oid);
-      if (c) for (const par of c.parents) queue.push(par);
-    }
-  }
-  {
-    const queue = [baseTip];
-    const seen = new Set<string>();
-    while (queue.length) {
-      const oid = queue.pop() as string;
-      if (seen.has(oid)) continue;
-      seen.add(oid);
-      if (headAncestors.has(oid)) { mergeBase = oid; break; }
-      const c = parseCommit(oid);
-      if (c) for (const par of c.parents) queue.push(par);
-    }
-  }
-  if (!mergeBase) return 'UNKNOWN';
-  const mbCommit = parseCommit(mergeBase);
-  if (!mbCommit) return 'UNKNOWN';
-  const mbFlat = flattenTree(mbCommit.tree);
-  const headFlat = flattenTree(headCommit.tree);
-  const baseFlat = flattenTree(baseCommit.tree);
-  const all = new Set([...mbFlat.keys(), ...headFlat.keys(), ...baseFlat.keys()]);
-  for (const path of all) {
-    const mb = mbFlat.get(path);
-    const h = headFlat.get(path);
-    const b = baseFlat.get(path);
-    const headChanged = (h?.oid ?? null) !== (mb?.oid ?? null);
-    const baseChanged = (b?.oid ?? null) !== (mb?.oid ?? null);
-    if (headChanged && baseChanged && (h?.oid ?? null) !== (b?.oid ?? null)) return 'CONFLICTING';
-  }
-  return 'MERGEABLE';
-}
-
-function squashMerge(r: RepoRec, p: PullRec): { sha: string } | null {
-  const headCommit = parseCommit(p.headSha);
-  const baseTip = resolveRef(r, p.baseRef);
-  if (!baseTip) return null;
-  const baseTipCommit = parseCommit(baseTip);
-  if (!headCommit || !baseTipCommit) return null;
-  const headFlat = flattenTree(headCommit.tree);
-  const baseFlat = flattenTree(baseTipCommit.tree);
-  let tree = baseTipCommit.tree;
-  for (const [path, h] of headFlat) {
-    tree = setPathInTree(tree, path.split('/'), h.oid);
-  }
-  // paths in base that head deleted relative to its own base are not tracked here;
-  // the suite's squash cases are pure additions/updates.
-  commitSeq += 1;
-  const sha = buildCommit(tree, [baseTip], p.title, COMMIT_EPOCH + commitSeq);
-  r.refs.set(p.baseRef, sha);
-  invalidateRepoCache(r);
-  return { sha };
-}
-
-function createIssueRec(r: RepoRec, title: string, body: string, labels: string[]): IssueRec {
-  r.counter += 1;
-  const i: IssueRec = { number: r.counter, title, body, state: 'open', labels, comments: [], user: VIEWER_LOGIN, createdSeq: ++seqCounter };
-  r.issues.set(i.number, i);
-  refreshIssueJson(r, i);
-  return i;
-}
-
-function createPullRec(r: RepoRec, title: string, body: string, head: string, base: string): PullRec | null {
-  const headSha = resolveRef(r, head);
-  const baseSha = resolveRef(r, base);
-  if (!headSha || !baseSha) return null;
-  r.counter += 1;
-  const p: PullRec = { number: r.counter, title, body, state: 'open', headRef: head, baseRef: base, headSha, baseSha, merged: false, mergedAt: null, mergeCommitSha: null, comments: [] };
-  r.pulls.set(p.number, p);
-  return p;
-}
+function refreshIssueJson(r: Repo, i: IssueRec): void { store.refreshIssue(r, i); }
+function issueJsonObject(r: Repo, i: IssueRec): Record<string, unknown> { return issueJson(r, i); }
+function pullJsonObject(r: Repo, p: PullRec): Record<string, unknown> { return pullJson(r, p); }
 
 // ---------------------------------------------------------------- HTTP plumbing
 
@@ -632,9 +366,8 @@ function handleRest(req: IncomingMessage, res: ServerResponse, path: string, q: 
           tree = deletePathInTree(tree, contentPath.split('/'));
         }
         if (tree === null) { sendError(res, 404, 'Not Found'); return; }
-        commitSeq += 1;
         const message = str(b.message, req.method === 'PUT' ? 'update' : 'delete');
-        const commitOid = buildCommit(tree, parents, message, COMMIT_EPOCH + commitSeq);
+        const commitOid = buildCommit(tree, parents, message, store.commitTime());
         r.refs.set(branch, commitOid);
         invalidateRepoCache(r);
         if (req.method === 'PUT') {
@@ -708,7 +441,7 @@ function handleRest(req: IncomingMessage, res: ServerResponse, path: string, q: 
           const parsed = parseJsonBody(body);
           if (!parsed.ok) { sendError(res, 400, 'Invalid JSON'); return; }
           const b = asObject(parsed.value);
-          const id = nextCommentId++;
+          const id = store.commentId();
           issue.comments.push({ id, body: str(b.body) });
           refreshIssueJson(r, issue);
           sendJson(res, 201, { id, body: str(b.body) });
@@ -776,7 +509,7 @@ function handleRest(req: IncomingMessage, res: ServerResponse, path: string, q: 
         if (p.state !== 'open') { sendError(res, 405, 'Pull request is not open'); return; }
         const status = mergeableStatus(r, p);
         if (status === 'CONFLICTING') { sendError(res, 405, 'Merge conflict'); return; }
-        const merged = squashMerge(r, p);
+        const merged = squashMerge(store, r, p);
         if (!merged) { sendError(res, 405, 'Cannot merge'); return; }
         p.state = 'merged';
         p.merged = true;
@@ -1126,7 +859,7 @@ function gqlResolve(obj: GqlObj, field: string, args: Record<string, unknown>, e
           const r = findRepoByDbId(parseInt(dec.parts[0] as string, 10));
           const p = r?.pulls.get(parseInt(dec.parts[1] as string, 10));
           if (r && p && p.state === 'open') {
-            const merged = squashMerge(r, p);
+            const merged = squashMerge(store, r, p);
             if (merged) { p.state = 'merged'; p.merged = true; p.mergedAt = FIXED_TIME; p.mergeCommitSha = merged.sha; wrapper = pullWrapper(r, p); }
           }
         }
@@ -1140,7 +873,7 @@ function gqlResolve(obj: GqlObj, field: string, args: Record<string, unknown>, e
           const r = findRepoByDbId(parseInt(dec.parts[0] as string, 10));
           const i = r?.issues.get(parseInt(dec.parts[1] as string, 10));
           if (r && i) {
-            const id = nextCommentId++;
+            const id = store.commentId();
             i.comments.push({ id, body: (input.body as string) ?? '' });
             refreshIssueJson(r, i);
             node = { __type: 'Comment', id, body: (input.body as string) ?? '' };
@@ -1488,7 +1221,7 @@ function handleMcp(body: Buffer): { status: number; payload: unknown } {
         if (!r || !p) return { status: 200, payload: mcpResult(id, { content: [{ type: 'text', text: 'Not Found' }], isError: true }) };
         if (p.state !== 'open') return { status: 200, payload: mcpResult(id, { content: [{ type: 'text', text: 'Pull request is not open' }], isError: true }) };
         if (mergeableStatus(r, p) === 'CONFLICTING') return { status: 200, payload: mcpResult(id, { content: [{ type: 'text', text: 'Merge conflict' }], isError: true }) };
-        const merged = squashMerge(r, p);
+        const merged = squashMerge(store, r, p);
         if (!merged) return { status: 200, payload: mcpResult(id, { content: [{ type: 'text', text: 'Cannot merge' }], isError: true }) };
         p.state = 'merged';
         p.merged = true;
