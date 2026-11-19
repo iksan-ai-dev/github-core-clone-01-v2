@@ -7,8 +7,7 @@
 // issue reads serve a pre-serialised JSON string; push fast-forwards take the direct-parent
 // fast path instead of walking history; hot paths avoid regexes and per-request allocations.
 
-import { createServer } from 'node:http';
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import { createServer, type RawReq as IncomingMessage, type RawRes as ServerResponse } from './rawhttp.ts';
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 
@@ -873,7 +872,13 @@ function createPullRec(r: RepoRec, title: string, body: string, head: string, ba
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
   const data = typeof body === 'string' ? body : JSON.stringify(body);
-  res.writeHead(status, { 'Content-Type': 'application/json', 'X-GitHub-Request-Id': nextReqId(), ...extra });
+  const len = Buffer.byteLength(data);
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Content-Length': len as unknown as string,
+    'X-GitHub-Request-Id': nextReqId(),
+    ...extra,
+  });
   res.end(data);
 }
 
@@ -882,7 +887,12 @@ function sendError(res: ServerResponse, status: number, message: string): void {
 }
 
 function sendBuffer(res: ServerResponse, status: number, data: Buffer, contentType: string, extra: Record<string, string> = {}): void {
-  res.writeHead(status, { 'Content-Type': contentType, 'X-GitHub-Request-Id': nextReqId(), ...extra });
+  res.writeHead(status, {
+    'Content-Type': contentType,
+    'Content-Length': data.length as unknown as string,
+    'X-GitHub-Request-Id': nextReqId(),
+    ...extra,
+  });
   res.end(data);
 }
 
@@ -930,7 +940,7 @@ function getQuery(rawUrl: string): URLSearchParams {
   return new URLSearchParams(q >= 0 ? rawUrl.slice(q + 1) : '');
 }
 
-function handleRest(req: IncomingMessage, res: ServerResponse, path: string, q: URLSearchParams, body: Buffer): void {
+function handleRest(req: IncomingMessage, res: ServerResponse, path: string, q: () => URLSearchParams, body: Buffer): void {
   // GET /api/v3/ root
   if (path === '/api/v3/' || path === '/api/v3') {
     sendJson(res, 200, { current_user_url: '/api/v3/user' }, { 'X-OAuth-Scopes': 'repo, user, read:org' });
@@ -958,8 +968,8 @@ function handleRest(req: IncomingMessage, res: ServerResponse, path: string, q: 
       return;
     }
     if (req.method === 'GET') {
-      const perPage = Math.max(1, num(parseInt(q.get('per_page') ?? '30', 10), 30) || 30);
-      const page = Math.max(1, num(parseInt(q.get('page') ?? '1', 10), 1) || 1);
+      const perPage = Math.max(1, num(parseInt(q().get('per_page') ?? '30', 10), 30) || 30);
+      const page = Math.max(1, num(parseInt(q().get('page') ?? '1', 10), 1) || 1);
       const all = [...repos.values()];
       const slice = all.slice((page - 1) * perPage, page * perPage);
       const extra: Record<string, string> = {};
@@ -1070,7 +1080,7 @@ function handleRest(req: IncomingMessage, res: ServerResponse, path: string, q: 
     }
 
     if (head === 'commits' && req.method === 'GET') {
-      const shaParam = q.get('sha');
+      const shaParam = q().get('sha');
       const start = shaParam ? resolveRef(r, shaParam) : defaultBranchTip(r);
       if (!start) { sendJson(res, 200, []); return; }
       const out: Record<string, unknown>[] = [];
@@ -1092,7 +1102,7 @@ function handleRest(req: IncomingMessage, res: ServerResponse, path: string, q: 
     if (head === 'contents') {
       const contentPath = sub.slice(1).join('/');
       if (req.method === 'GET') {
-        const refParam = q.get('ref');
+        const refParam = q().get('ref');
         const commitOid = refParam ? resolveRef(r, refParam) : defaultBranchTip(r);
         if (!commitOid) { sendError(res, 404, 'Not Found'); return; }
         const c = parseCommit(commitOid);
@@ -1196,9 +1206,9 @@ function handleRest(req: IncomingMessage, res: ServerResponse, path: string, q: 
           return;
         }
         if (req.method === 'GET') {
-          const state = q.get('state') ?? 'open';
-          const sort = q.get('sort') ?? 'created';
-          const dir = q.get('direction') ?? 'desc';
+          const state = q().get('state') ?? 'open';
+          const sort = q().get('sort') ?? 'created';
+          const dir = q().get('direction') ?? 'desc';
           let list = [...r.issues.values()];
           if (state !== 'all') list = list.filter((i) => i.state === state);
           if (sort === 'created') list.sort((a, b) => dir === 'asc' ? a.number - b.number : b.number - a.number);
@@ -1273,7 +1283,7 @@ function handleRest(req: IncomingMessage, res: ServerResponse, path: string, q: 
           return;
         }
         if (req.method === 'GET') {
-          const state = q.get('state') ?? 'open';
+          const state = q().get('state') ?? 'open';
           let list = [...r.pulls.values()];
           if (state !== 'all') {
             const want = state === 'closed' ? ['closed', 'merged'] : ['open'];
@@ -2036,7 +2046,7 @@ function handleMcp(body: Buffer): { status: number; payload: unknown } {
 // ---------------------------------------------------------------- git smart HTTP
 
 const AGENT_CAP = 'github-core-clone/1.0';
-const UPLOAD_CAPS = `symref=HEAD:refs/heads/main object-format=sha1 agent=${AGENT_CAP}`;
+const UPLOAD_CAPS = `multi_ack_detailed side-band-64k thin-pack no-progress shallow ofs-delta include-tag symref=HEAD:refs/heads/main object-format=sha1 agent=${AGENT_CAP}`;
 const V2_CAPS = ['version 2\n', 'ls-refs=unborn\n', 'fetch=shallow thin-pack\n', `agent=${AGENT_CAP}\n`, 'object-format=sha1\n'];
 
 function refLines(r: RepoRec, peeled: boolean): { ref: string; oid: string; peeledOid: string | null }[] {
@@ -2051,6 +2061,19 @@ function refLines(r: RepoRec, peeled: boolean): { ref: string; oid: string; peel
     out.push({ ref: `refs/tags/${t}`, oid, peeledOid });
   }
   return out;
+}
+
+/** True when a git-upload-pack body is protocol v2 (it opens with `command=`). */
+function bodyLooksV2(body: Buffer): boolean {
+  if (body.length < 12) return false;
+  for (let off = 0; off + 4 <= body.length; ) {
+    const len = parseInt(body.toString('ascii', off, off + 4), 16);
+    if (!Number.isFinite(len) || len < 4) return false;
+    if (len === 0 || len === 1) return false;
+    if (body.toString('latin1', off + 4, off + 12) === 'command=') return true;
+    off += len;
+  }
+  return false;
 }
 
 function v2Advertisement(r: RepoRec): Buffer {
@@ -2295,7 +2318,8 @@ const server = createServer((req, res) => {
       const rawUrl = req.url ?? '/';
       const qIdx = rawUrl.indexOf('?');
       const path = qIdx >= 0 ? rawUrl.slice(0, qIdx) : rawUrl;
-      const q = getQuery(rawUrl);
+      let qLazy: URLSearchParams | null = null;
+      const q = (): URLSearchParams => (qLazy ??= new URLSearchParams(qIdx >= 0 ? rawUrl.slice(qIdx + 1) : ''));
       const method = req.method ?? 'GET';
 
       if (path === '/healthz') {
@@ -2314,11 +2338,16 @@ const server = createServer((req, res) => {
         if (!r) { sendError(res, 404, 'Not Found'); return; }
         const body = method === 'POST' ? await readBody(req) : Buffer.alloc(0);
         if (tail === 'info/refs') {
-          const service = q.get('service') ?? '';
+          const service = q().get('service') ?? '';
           if (service === 'git-upload-pack') {
-            const proto = req.headers['git-protocol'];
-            if (proto === 'version=2') sendBuffer(res, 200, v2Advertisement(r), 'application/x-git-upload-pack-advertisement');
-            else sendBuffer(res, 200, v0Advertisement(r, 'upload'), 'application/x-git-upload-pack-advertisement');
+            // Honour the client's dialect: v2 when it asks for it (the conformance
+            // checks require a real v2 advertisement), v0 otherwise. Each dialect
+            // keeps its own cached Buffer, so the choice costs nothing per request.
+            if ((req.headers['git-protocol'] ?? '') === 'version=2') {
+              sendBuffer(res, 200, v2Advertisement(r), 'application/x-git-upload-pack-advertisement');
+            } else {
+              sendBuffer(res, 200, v0Advertisement(r, 'upload'), 'application/x-git-upload-pack-advertisement');
+            }
             return;
           }
           if (service === 'git-receive-pack') {
@@ -2329,14 +2358,11 @@ const server = createServer((req, res) => {
           return;
         }
         if (tail === 'git-upload-pack' && method === 'POST') {
-          const proto = req.headers['git-protocol'];
-          if (proto === 'version=2') {
-            const out = handleUploadPack(r, body);
-            sendBuffer(res, 200, out, 'application/x-git-upload-pack-result');
-          } else {
-            const out = handleV0Fetch(r, body);
-            sendBuffer(res, 200, out, 'application/x-git-upload-pack-result');
-          }
+          // We advertised v0, so a conforming client speaks v0 here. Some clients
+          // still send a v2 body: detect it from the first command so neither
+          // dialect is ever mis-parsed.
+          const out = bodyLooksV2(body) ? handleUploadPack(r, body) : handleV0Fetch(r, body);
+          sendBuffer(res, 200, out, 'application/x-git-upload-pack-result');
           return;
         }
         if (tail === 'git-receive-pack' && method === 'POST') {
@@ -2394,7 +2420,7 @@ async function fetchJson(url: string, options: { method?: string; body?: string 
 }
 
 async function main(): Promise<void> {
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  await new Promise<void>((resolve) => server.listen(0, () => resolve()));
   const addr = server.address();
   const port = typeof addr === 'object' && addr ? addr.port : 0;
   if (ENV_URL) {
